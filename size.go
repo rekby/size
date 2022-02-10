@@ -44,10 +44,14 @@ type memRange struct {
 }
 
 type state struct {
-	ranges          []memRange
-	visited         map[uintptr]empty
-	unaddressedSize uintptr
-	err             error
+	ranges             []memRange
+	visited            map[uintptr]empty
+	unaddressedSizeVal uintptr
+	err                error
+}
+
+func (s *state) addUnaddressableValue(size uintptr) {
+	s.unaddressedSizeVal += upToCluster(size)
 }
 
 func newState() *state {
@@ -60,7 +64,7 @@ func (s *state) addObject(info *objwalker.WalkInfo) error {
 	if info.HasDirectPointer() {
 		s.addRange(info.DirectPointer, info.Value.Type().Size())
 	} else {
-		s.unaddressedSize += info.Value.Type().Size()
+		s.addUnaddressableValue(info.Value.Type().Size())
 	}
 
 	switch info.Value.Kind() {
@@ -79,8 +83,8 @@ func (s *state) addObject(info *objwalker.WalkInfo) error {
 }
 
 func (s *state) addMap(info *objwalker.WalkInfo) {
-	s.unaddressedSize += uintptr(info.Value.Len()) * mapItemOverhead
-	s.unaddressedSize += hmapSize
+	s.addUnaddressableValue(uintptr(info.Value.Len()) * mapItemOverhead)
+	s.addUnaddressableValue(hmapSize)
 }
 
 func (s *state) addChan(info *objwalker.WalkInfo) {
@@ -94,7 +98,7 @@ func (s *state) addChan(info *objwalker.WalkInfo) {
 		s.visited[pointerToHChan] = empty{}
 	}
 	itemSize := info.Value.Type().Elem().Size()
-	s.unaddressedSize += itemSize * uintptr(info.Value.Cap())
+	s.addUnaddressableValue(itemSize * uintptr(info.Value.Cap()))
 }
 
 func (s *state) addSlice(info *objwalker.WalkInfo) {
@@ -104,7 +108,7 @@ func (s *state) addSlice(info *objwalker.WalkInfo) {
 		sliceHeader := (*reflect.SliceHeader)(info.DirectPointer)
 		s.addRange(unsafe.Pointer(sliceHeader.Data), sliceSize)
 	} else {
-		s.unaddressedSize += sliceSize
+		s.addUnaddressableValue(sliceSize)
 	}
 }
 
@@ -113,7 +117,7 @@ func (s *state) addString(info *objwalker.WalkInfo) {
 		stringHeader := (*reflect.StringHeader)(info.DirectPointer)
 		s.addRange(unsafe.Pointer(stringHeader.Data), uintptr(info.Value.Len()))
 	} else {
-		s.unaddressedSize += uintptr(info.Value.Len())
+		s.addUnaddressableValue(uintptr(info.Value.Len()))
 	}
 }
 
@@ -161,10 +165,31 @@ func (s *state) compress() {
 func (s *state) sum() int {
 	var res uintptr
 	for _, r := range s.ranges {
-		res += r.Last - r.First + 1
+		res += upToCluster(r.Last - r.First + 1)
 	}
-	res += s.unaddressedSize
+	res += s.unaddressedSizeVal
 	var zeroPointer unsafe.Pointer
 	res -= unsafe.Sizeof(zeroPointer)
 	return int(res)
+}
+
+const _NumSizeClasses = 68
+
+var class_to_size = [_NumSizeClasses]uintptr{0, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2688, 3072, 3200, 3456, 4096, 4864, 5376, 6144, 6528, 6784, 6912, 8192, 9472, 9728, 10240, 10880, 12288, 13568, 14336, 16384, 18432, 19072, 20480, 21760, 24576, 27264, 28672, 32768}
+
+const (
+	_PageShift = 13
+	_PageSize  = 1 << _PageShift
+)
+
+func upToCluster(size uintptr) uintptr {
+	for _, clusterSize := range class_to_size {
+		if size <= clusterSize {
+			return clusterSize
+		}
+	}
+	if size%_PageSize != 0 {
+		size = ((size / _PageSize) + 1) * _PageSize
+	}
+	return size
 }
